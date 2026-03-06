@@ -1,0 +1,993 @@
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
+
+/* ─────────────────────────────────────────────
+   STORAGE (persiste dados entre sessões)
+───────────────────────────────────────────── */
+const store = {
+  async get(k) { try { const r = await window.storage.get(k); return r ? JSON.parse(r.value) : null; } catch { return null; } },
+  async set(k, v) { try { await window.storage.set(k, JSON.stringify(v)); } catch(e) { console.error(e); } },
+};
+
+/* ─────────────────────────────────────────────
+   CONSTANTS
+───────────────────────────────────────────── */
+const ADMIN_USER = "rvm.adm";
+const ADMIN_PASS = "RVM@adm2024";
+const PGFN_MOD = ["Simples Nacional","Previdenciário","Não Previdenciário","FGTS","Outros PGFN"];
+const RFB_MOD  = ["Parcelamento Comum","PERT","Transação Tributária","Refis","Outros RFB"];
+const TODAY = () => new Date().toISOString().split("T")[0];
+
+const fmt    = v => Number(v||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"});
+const fmtDt  = d => { if(!d) return "—"; const[y,m,dy]=d.split("-"); return`${dy}/${m}/${y}`; };
+const mLabel = d => { if(!d) return ""; const[y,m]=d.split("-"); return["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][+m-1]+"/"+y.slice(2); };
+const cleanCNPJ = s => (s||"").replace(/\D/g,"");
+
+function autoStatus(venc, sitPDF) {
+  if (sitPDF === "Paga") return "Paga";
+  return venc <= TODAY() ? "Vencida" : "A vencer";
+}
+function genParcelas(total, start, valor) {
+  const list = []; let [y,m,d] = start.split("-").map(Number);
+  for (let i=1;i<=total;i++) {
+    const dt=`${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+    list.push({numero:i,vencimento:dt,valor:Number(valor),situacaoPDF:"A vencer",status:autoStatus(dt,"A vencer")});
+    m++; if(m>12){m=1;y++;}
+  }
+  return list;
+}
+
+const EXTRACT_PROMPT = `Você é especialista tributário brasileiro. Extraia dados de parcelamento fiscal deste documento.
+Retorne SOMENTE JSON válido (sem markdown) com esta estrutura:
+{"cliente":{"nome":null,"cnpj":null},"orgao":null,"modalidade":null,"numNegociacao":null,"programa":null,"situacao":null,"formaPagamento":null,"valorConsolidado":null,"saldoSemJuros":null,"saldoComJuros":null,"semDesconto":null,"descontoPercent":null,"aposDesconto":null,"prestacoes":[{"numero":1,"vencimento":"YYYY-MM-DD","valor":0,"situacaoPDF":"Paga|A vencer|Devedora","saldoDevedor":null}]}
+Regras: orgao="PGFN" ou "RFB"; formaPagamento="Boleto" ou "Débito Automático"; situacaoPDF="Paga" se saldo=0 ou palavra paga; datas YYYY-MM-DD; valores numéricos sem formatação; null em campos não encontrados.`;
+
+/* ─────────────────────────────────────────────
+   RVM LAW LOGO
+───────────────────────────────────────────── */
+function RVMLogo({ size="md" }) {
+  const cfg = { sm:{rvm:11,law:10,pad:"5px 8px"},md:{rvm:15,law:13,pad:"7px 11px"},lg:{rvm:26,law:22,pad:"12px 18px"} }[size];
+  return (
+    <div style={{display:"flex",alignItems:"stretch",lineHeight:1}}>
+      <div style={{background:"#111",padding:cfg.pad}}>
+        <span style={{color:"#fff",fontWeight:800,fontSize:cfg.rvm,letterSpacing:"0.12em",fontFamily:"'Barlow',sans-serif"}}>RVM</span>
+      </div>
+      <div style={{background:"#e2e2e2",padding:cfg.pad}}>
+        <span style={{color:"#888",fontWeight:500,fontSize:cfg.law,letterSpacing:"0.18em",fontFamily:"'Barlow',sans-serif"}}>LAW</span>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   APP ROOT
+───────────────────────────────────────────── */
+export default function App() {
+  const [auth, setAuth]   = useState(null); // null | {role:"admin"} | {role:"client", clienteId, cnpj}
+  const [data, setData]   = useState({clientes:[], parcelamentos:[]});
+  const [loading, setLoading] = useState(true);
+
+  // Load persisted data
+  useEffect(()=>{
+    (async()=>{
+      const saved = await store.get("rvm-data");
+      if(saved) setData(saved);
+      setLoading(false);
+    })();
+  },[]);
+
+  // Persist on change
+  useEffect(()=>{ if(!loading) store.set("rvm-data", data); },[data, loading]);
+
+  const updateData = useCallback(updater => setData(d => { const nd = updater(d); return nd; }), []);
+
+  if(loading) return <Splash />;
+  if(!auth) return <LoginPage data={data} onLogin={setAuth} />;
+  if(auth.role==="admin") return <AdminApp data={data} updateData={updateData} onLogout={()=>setAuth(null)} />;
+  return <ClientApp data={data} auth={auth} onLogout={()=>setAuth(null)} />;
+}
+
+/* ─────────────────────────────────────────────
+   SPLASH
+───────────────────────────────────────────── */
+function Splash() {
+  return (
+    <div style={{...C.center,background:"#f8f8f8",minHeight:"100vh"}}>
+      <RVMLogo size="lg" />
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   LOGIN PAGE
+───────────────────────────────────────────── */
+function LoginPage({ data, onLogin }) {
+  const [login, setLogin] = useState("");
+  const [pass,  setPass]  = useState("");
+  const [error, setError] = useState("");
+  const [showPass, setShowPass] = useState(false);
+
+  const handleLogin = () => {
+    setError("");
+    // Admin
+    if(login.trim()===ADMIN_USER && pass===ADMIN_PASS) { onLogin({role:"admin"}); return; }
+    // Client: login = CNPJ, pass = senha cadastrada
+    const rawLogin = cleanCNPJ(login);
+    const cliente = data.clientes.find(c => cleanCNPJ(c.cnpj)===rawLogin && c.senha && c.senha===pass);
+    if(cliente) { onLogin({role:"client", clienteId:cliente.id, cnpj:cliente.cnpj, nome:cliente.nome}); return; }
+    setError("Credenciais inválidas. Verifique o login e a senha.");
+  };
+
+  return (
+    <div style={C.loginBg}>
+      <div style={C.loginSide}>
+        <div style={{flex:1,display:"flex",flexDirection:"column",justifyContent:"center"}}>
+          <RVMLogo size="lg" />
+          <div style={{marginTop:40}}>
+            <div style={C.loginTagline}>Portal de Parcelamentos Fiscais</div>
+            <div style={C.loginDesc}>Acesso seguro e centralizado às informações de parcelamentos PGFN e Receita Federal dos seus clientes.</div>
+          </div>
+        </div>
+        <div style={C.loginFooter}>© {new Date().getFullYear()} RVM Law · Todos os direitos reservados</div>
+      </div>
+      <div style={C.loginForm}>
+        <div style={C.loginCard}>
+          <div style={C.loginCardTitle}>Acesso ao Portal</div>
+          <div style={C.loginCardSub}>Administrador: use seu login RVM<br/>Cliente: use o CNPJ da empresa</div>
+          <div style={{marginTop:28,display:"flex",flexDirection:"column",gap:14}}>
+            <div>
+              <label style={C.label}>Login / CNPJ</label>
+              <input style={C.inp} value={login} onChange={e=>setLogin(e.target.value)} placeholder="rvm.adm ou 00.000.000/0001-00" onKeyDown={e=>e.key==="Enter"&&handleLogin()} autoFocus/>
+            </div>
+            <div>
+              <label style={C.label}>Senha</label>
+              <div style={{position:"relative"}}>
+                <input style={C.inp} type={showPass?"text":"password"} value={pass} onChange={e=>setPass(e.target.value)} placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&handleLogin()}/>
+                <button style={C.eyeBtn} onClick={()=>setShowPass(s=>!s)}>{showPass?"○":"●"}</button>
+              </div>
+            </div>
+            {error && <div style={C.errorBox}>{error}</div>}
+            <button style={{...C.primaryBtn,width:"100%",padding:"13px",marginTop:4,fontSize:14}} onClick={handleLogin}>Entrar</button>
+          </div>
+          <div style={{marginTop:24,paddingTop:20,borderTop:"1px solid #e5e7eb",textAlign:"center",fontSize:12,color:"#9ca3af"}}>
+            Dificuldades de acesso? Entre em contato com a RVM Law.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   ADMIN APP
+───────────────────────────────────────────── */
+function AdminApp({ data, updateData, onLogout }) {
+  const [view, setView]     = useState("dashboard");
+  const [modal, setModal]   = useState(null);
+  const [selCli, setSelCli] = useState(null);
+  const [selParc, setSelParc] = useState(null);
+  const [form, setForm]     = useState({});
+  const [toast, setToast]   = useState(null);
+  const [cfCli, setCfCli]   = useState("");
+  const [cfOrg, setCfOrg]   = useState("Todos");
+  const [importStep, setImportStep] = useState("idle");
+  const [importing, setImporting]   = useState(false);
+
+  const showToast = (msg,type="ok")=>{ setToast({msg,type}); setTimeout(()=>setToast(null),3000); };
+  const sf = k => v => setForm(f=>({...f,[k]:v}));
+
+  // ── DATA OPS ──
+  const addCliente = () => {
+    if(!form.nome||!form.cnpj) return showToast("Nome e CNPJ obrigatórios","err");
+    updateData(d=>({...d,clientes:[...d.clientes,{id:Date.now(),...form}]}));
+    setForm({}); setModal(null); showToast("Cliente adicionado!");
+  };
+  const saveClienteSenha = () => {
+    if(!form._editId) return;
+    updateData(d=>({...d,clientes:d.clientes.map(c=>c.id===form._editId?{...c,senha:form.senha,responsavel:form.responsavel||c.responsavel}:c)}));
+    setModal(null); showToast("Acesso salvo!");
+  };
+  const addParcelamento = (override={}) => {
+    const f={...form,...override};
+    if(!f.clienteId||!f.orgao||!f.modalidade||!f.numParcelas||!f.valorParcela||!f.dataInicio)
+      return showToast("Preencha campos obrigatórios (*)","err");
+    const parcelas = f.prestacoes || genParcelas(Number(f.numParcelas),f.dataInicio,f.valorParcela);
+    const novo={id:Date.now(),clienteId:Number(f.clienteId),orgao:f.orgao,modalidade:f.modalidade,
+      numNegociacao:f.numNegociacao||"",programa:f.programa||"",numParcelas:Number(f.numParcelas),
+      valorParcela:Number(f.valorParcela),formaPagamento:f.formaPagamento||"Boleto",
+      situacao:f.situacao||"Ativo",valorConsolidado:Number(f.valorConsolidado||0),
+      saldoSemJuros:Number(f.saldoSemJuros||0),saldoComJuros:Number(f.saldoComJuros||0),
+      semDesconto:Number(f.semDesconto||0),descontoPercent:Number(f.descontoPercent||0),
+      aposDesconto:Number(f.aposDesconto||0),dataInicio:f.dataInicio,parcelas};
+    updateData(d=>({...d,parcelamentos:[...d.parcelamentos,novo]}));
+    setForm({}); setModal(null); showToast("Parcelamento registrado!");
+  };
+  const toggleParcela = (pId,num)=>{
+    updateData(d=>({...d,parcelamentos:d.parcelamentos.map(p=>{
+      if(p.id!==pId) return p;
+      return {...p,parcelas:p.parcelas.map(pr=>{
+        if(pr.numero!==num) return pr;
+        const nx = pr.status==="Paga" ? autoStatus(pr.vencimento,"") : "Paga";
+        return {...pr,status:nx};
+      })};
+    })}));
+    setSelParc(p=>p?({...p,parcelas:p.parcelas.map(pr=>{
+      if(pr.numero!==num) return pr;
+      const nx=pr.status==="Paga"?autoStatus(pr.vencimento,""):"Paga";
+      return {...pr,status:nx};
+    })}):p);
+  };
+
+  // ── AI IMPORT ──
+  const handleFile = async e => {
+    const file=e.target.files[0]; if(!file) return;
+    setImporting(true); setImportStep("reading");
+    try {
+      let content;
+      const ext=file.name.split(".").pop().toLowerCase();
+      if(ext==="pdf"){
+        const buf=await file.arrayBuffer();
+        const b64=btoa(String.fromCharCode(...new Uint8Array(buf)));
+        content=[{type:"document",source:{type:"base64",media_type:"application/pdf",data:b64}},{type:"text",text:EXTRACT_PROMPT}];
+      } else {
+        const XLSX=await import("https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs");
+        const buf=await file.arrayBuffer();
+        const wb=XLSX.read(buf); let txt="";
+        wb.SheetNames.forEach(s=>{txt+=`\n--- ${s} ---\n`;txt+=XLSX.utils.sheet_to_csv(wb.Sheets[s]);});
+        content=[{type:"text",text:EXTRACT_PROMPT+"\n\nArquivo:\n"+txt}];
+      }
+      const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:4000,messages:[{role:"user",content}]})});
+      const json=await res.json();
+      const raw=json.content?.map(b=>b.text||"").join("").trim().replace(/```json|```/g,"").trim();
+      const ex=JSON.parse(raw);
+      const cMatch=data.clientes.find(c=>cleanCNPJ(c.cnpj)===cleanCNPJ(ex.cliente?.cnpj||""));
+      setForm({
+        clienteId:cMatch?.id||"",clienteNomeEx:ex.cliente?.nome||"",clienteCNPJEx:ex.cliente?.cnpj||"",
+        orgao:ex.orgao||"",modalidade:ex.modalidade||"",numNegociacao:ex.numNegociacao||"",
+        programa:ex.programa||"",situacao:ex.situacao||"Ativo",formaPagamento:ex.formaPagamento||"Boleto",
+        valorConsolidado:ex.valorConsolidado||"",saldoSemJuros:ex.saldoSemJuros||"",
+        saldoComJuros:ex.saldoComJuros||"",semDesconto:ex.semDesconto||"",
+        descontoPercent:ex.descontoPercent||"",aposDesconto:ex.aposDesconto||"",
+        numParcelas:ex.prestacoes?.length||"",valorParcela:ex.prestacoes?.[0]?.valor||"",
+        dataInicio:ex.prestacoes?.[0]?.vencimento||"",
+        prestacoes:ex.prestacoes?.map((pr,i)=>({numero:pr.numero||i+1,vencimento:pr.vencimento,valor:pr.valor,
+          situacaoPDF:pr.situacaoPDF||"A vencer",status:autoStatus(pr.vencimento,pr.situacaoPDF),saldoDevedor:pr.saldoDevedor||0}))||[],
+      });
+      setImportStep("reviewing");
+    } catch(err){ showToast("Erro: "+err.message,"err"); setImportStep("idle"); }
+    finally{ setImporting(false); e.target.value=""; }
+  };
+  const confirmImport = () => {
+    if(!form.clienteId){
+      if(!form.clienteNomeEx) return showToast("Selecione ou informe o cliente","err");
+      const nc={id:Date.now(),nome:form.clienteNomeEx,cnpj:form.clienteCNPJEx,responsavel:"",senha:""};
+      updateData(d=>({...d,clientes:[...d.clientes,nc]}));
+      addParcelamento({clienteId:nc.id});
+    } else { addParcelamento(); }
+    setImportStep("idle");
+  };
+
+  // ── STATS ──
+  const cliStats = useCallback(cid=>{
+    const ps=data.parcelamentos.filter(p=>p.clienteId===cid);
+    const all=ps.flatMap(p=>p.parcelas);
+    const pagas=all.filter(x=>x.status==="Paga").length;
+    const vencidas=all.filter(x=>x.status==="Vencida").length;
+    const saldo=all.filter(x=>x.status!=="Paga").reduce((s,pr)=>s+pr.valor,0);
+    return{total:all.length,pagas,vencidas,aVencer:all.length-pagas-vencidas,saldo,numParc:ps.length};
+  },[data]);
+
+  // ── CASH FLOW ──
+  const cashFlow = useMemo(()=>{
+    const src=cfCli?data.parcelamentos.filter(p=>p.clienteId===Number(cfCli)):data.parcelamentos;
+    const fil=cfOrg==="Todos"?src:src.filter(p=>p.orgao===cfOrg);
+    const map={};
+    fil.forEach(p=>p.parcelas.forEach(pr=>{
+      if(pr.status==="Paga") return;
+      const k=pr.vencimento.slice(0,7);
+      if(!map[k])map[k]={mes:k,label:mLabel(pr.vencimento+"-01"),total:0,vencidas:0,aVencer:0};
+      map[k].total+=pr.valor;
+      pr.status==="Vencida"?map[k].vencidas+=pr.valor:map[k].aVencer+=pr.valor;
+    }));
+    return Object.values(map).sort((a,b)=>a.mes.localeCompare(b.mes));
+  },[data,cfCli,cfOrg]);
+
+  const exportJSON=()=>{const b=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=`rvm-dados-${TODAY()}.json`;a.click();showToast("Exportado!");};
+  const importJSON=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>{try{updateData(()=>JSON.parse(ev.target.result));showToast("Importado!");}catch{showToast("Arquivo inválido","err");}};r.readAsText(f);e.target.value="";};
+
+  const cliObj=data.clientes.find(c=>c.id===selCli);
+  const nav=[
+    {id:"dashboard",icon:"⬛",label:"Dashboard"},
+    {id:"importar",icon:"⚡",label:"Importar IA"},
+    {id:"fluxo",icon:"▦",label:"Fluxo de Caixa"},
+    {id:"clientes",icon:"◎",label:"Clientes"},
+    {id:"parcelamentos",icon:"≡",label:"Parcelamentos"},
+    {id:"relatorio",icon:"◧",label:"Relatório"},
+    {id:"usuarios",icon:"⬡",label:"Acessos"},
+  ];
+
+  return (
+    <div style={C.root}>
+      <style>{FONTS}</style>
+      {/* SIDEBAR */}
+      <aside style={C.sidebar}>
+        <div style={C.sideTop}>
+          <RVMLogo size="sm"/>
+          <div style={{marginTop:4,fontSize:10,color:"#9ca3af",letterSpacing:"0.08em",textTransform:"uppercase"}}>Administrador</div>
+        </div>
+        <nav style={C.nav}>
+          {nav.map(n=>(
+            <button key={n.id} style={{...C.navBtn,...(view===n.id?C.navActive:{})}} onClick={()=>setView(n.id)}>
+              <span style={{fontSize:12,width:16,textAlign:"center",flexShrink:0}}>{n.icon}</span>
+              {n.label}
+              {n.id==="importar"&&<span style={C.aiTag}>IA</span>}
+            </button>
+          ))}
+        </nav>
+        <div style={C.sideBot}>
+          <button style={C.sideSmBtn} onClick={exportJSON}>↓ Exportar dados</button>
+          <label style={C.sideSmBtn}>↑ Importar dados<input type="file" accept=".json" style={{display:"none"}} onChange={importJSON}/></label>
+          <button style={{...C.sideSmBtn,color:"#ef4444",borderColor:"#fca5a5"}} onClick={onLogout}>Sair</button>
+        </div>
+      </aside>
+
+      {/* MAIN */}
+      <main style={C.main}>
+
+        {/* DASHBOARD */}
+        {view==="dashboard"&&(
+          <Page title="Dashboard" sub="Visão geral consolidada">
+            <div style={C.grid4}>
+              <Stat label="Clientes" val={data.clientes.length} accent="#111"/>
+              <Stat label="Parcelamentos" val={data.parcelamentos.length} accent="#374151"/>
+              <Stat label="Parcelas Vencidas" val={data.parcelamentos.flatMap(p=>p.parcelas).filter(x=>x.status==="Vencida").length} accent="#ef4444"/>
+              <Stat label="Saldo Devedor Total" val={fmt(data.parcelamentos.flatMap(p=>p.parcelas).filter(x=>x.status!=="Paga").reduce((s,pr)=>s+pr.valor,0))} accent="#111"/>
+            </div>
+            {cashFlow.length>0&&(
+              <div style={C.card}>
+                <div style={C.cardTitle}>Fluxo de Caixa — Todos os Clientes</div>
+                <CF data={cashFlow.slice(0,18)}/>
+              </div>
+            )}
+            <h3 style={C.secHead}>Alertas — Parcelas Vencidas</h3>
+            {data.clientes.filter(c=>cliStats(c.id).vencidas>0).map(c=>{
+              const s=cliStats(c.id);
+              return(
+                <div key={c.id} style={C.alertRow}>
+                  <span style={{color:"#ef4444",fontWeight:700}}>⚠</span>
+                  <span style={{fontWeight:700,flex:1,color:"#111"}}>{c.nome}</span>
+                  <span style={C.tagRed}>{s.vencidas} vencida{s.vencidas>1?"s":""}</span>
+                  <span style={{color:"#ef4444",fontWeight:700,fontSize:13}}>{fmt(s.saldo)}</span>
+                  <button style={C.link} onClick={()=>{setSelCli(c.id);setView("relatorio");}}>Ver →</button>
+                </div>
+              );
+            })}
+            {data.clientes.filter(c=>cliStats(c.id).vencidas>0).length===0&&<p style={{color:"#16a34a",fontSize:13}}>✓ Nenhum alerta no momento.</p>}
+          </Page>
+        )}
+
+        {/* IMPORTAR */}
+        {view==="importar"&&(
+          <Page title="Importar com IA" sub="Envie PDF (PGFN/RFB) ou Excel — a IA extrai os dados automaticamente">
+            {importStep==="idle"&&(
+              <div style={C.uploadBox}>
+                <div style={{fontSize:36,marginBottom:12}}>⚡</div>
+                <div style={{fontWeight:700,fontSize:17,color:"#111",marginBottom:6}}>Selecione o arquivo</div>
+                <div style={{color:"#6b7280",fontSize:13,marginBottom:20}}>PDF da PGFN · PDF da RFB · Excel do portal ou do escritório</div>
+                <label style={{...C.primaryBtn,cursor:"pointer",display:"inline-block"}}>
+                  {importing?"Lendo com IA...":"Selecionar arquivo"}
+                  <input type="file" accept=".pdf,.xlsx,.xls,.csv" style={{display:"none"}} onChange={handleFile} disabled={importing}/>
+                </label>
+                <div style={{marginTop:14,color:"#9ca3af",fontSize:11}}>A IA extrai: cliente, CNPJ, modalidade, parcelas, valores, descontos e situação.</div>
+              </div>
+            )}
+            {importStep==="reading"&&(
+              <div style={{...C.uploadBox}}>
+                <div style={{fontSize:28,marginBottom:12,color:"#111"}}>⟳</div>
+                <div style={{fontWeight:600,color:"#374151"}}>Analisando arquivo com IA...</div>
+              </div>
+            )}
+            {importStep==="reviewing"&&(
+              <div>
+                <div style={C.successBox}>✓ Arquivo lido. Revise os dados abaixo antes de salvar — campos em laranja não foram encontrados.</div>
+                <div style={C.card}>
+                  <div style={C.cardTitle}>Cliente</div>
+                  <div style={C.fg2}>
+                    <div style={{gridColumn:"1/-1"}}>
+                      <L>Vincular a cliente existente</L>
+                      <select style={C.inp} value={form.clienteId||""} onChange={e=>sf("clienteId")(e.target.value)}>
+                        <option value="">— Criar novo: {form.clienteNomeEx||"?"} —</option>
+                        {data.clientes.map(c=><option key={c.id} value={c.id}>{c.nome} — {c.cnpj}</option>)}
+                      </select>
+                    </div>
+                    {!form.clienteId&&<>
+                      <FI label="Nome extraído" v={form.clienteNomeEx||""} s={sf("clienteNomeEx")} warn={!form.clienteNomeEx}/>
+                      <FI label="CNPJ extraído" v={form.clienteCNPJEx||""} s={sf("clienteCNPJEx")} warn={!form.clienteCNPJEx}/>
+                    </>}
+                  </div>
+                </div>
+                <div style={C.card}>
+                  <div style={C.cardTitle}>Negociação</div>
+                  <div style={C.fg2}>
+                    <div><L>Órgão</L><select style={C.inp} value={form.orgao||""} onChange={e=>{sf("orgao")(e.target.value);sf("modalidade")("");}}>
+                      <option value="">—</option><option>PGFN</option><option>RFB</option></select></div>
+                    <div><L>Modalidade</L><select style={C.inp} value={form.modalidade||""} onChange={e=>sf("modalidade")(e.target.value)}>
+                      <option value="">—</option>
+                      {(form.orgao==="PGFN"?PGFN_MOD:form.orgao==="RFB"?RFB_MOD:[...PGFN_MOD,...RFB_MOD]).map(m=><option key={m}>{m}</option>)}</select></div>
+                    <FI label="Nº Negociação" v={form.numNegociacao||""} s={sf("numNegociacao")} warn={!form.numNegociacao}/>
+                    <FI label="Programa" v={form.programa||""} s={sf("programa")}/>
+                    <div><L>Forma Pagamento</L><select style={C.inp} value={form.formaPagamento||"Boleto"} onChange={e=>sf("formaPagamento")(e.target.value)}>
+                      <option>Boleto</option><option>Débito Automático</option></select></div>
+                    <div><L>Situação</L><select style={C.inp} value={form.situacao||"Ativo"} onChange={e=>sf("situacao")(e.target.value)}>
+                      <option>Ativo</option><option>Quitado</option><option>Rescindido</option></select></div>
+                    <FI label="Valor Consolidado (R$)" v={form.valorConsolidado||""} s={sf("valorConsolidado")} t="number" warn={!form.valorConsolidado}/>
+                    <FI label="Saldo sem Juros (R$)" v={form.saldoSemJuros||""} s={sf("saldoSemJuros")} t="number"/>
+                    <FI label="Saldo com Juros (R$)" v={form.saldoComJuros||""} s={sf("saldoComJuros")} t="number"/>
+                    <FI label="Sem Desconto (R$)" v={form.semDesconto||""} s={sf("semDesconto")} t="number"/>
+                    <FI label="Desconto (%)" v={form.descontoPercent||""} s={sf("descontoPercent")} t="number"/>
+                    <FI label="Após Desconto (R$)" v={form.aposDesconto||""} s={sf("aposDesconto")} t="number"/>
+                  </div>
+                </div>
+                {form.prestacoes?.length>0&&(
+                  <div style={C.card}>
+                    <div style={C.cardTitle}>Prestações extraídas — {form.prestacoes.length} parcelas</div>
+                    <div style={{maxHeight:300,overflowY:"auto"}}>
+                      <table style={C.tbl}>
+                        <thead><tr>{["Nº","Vencimento","Valor","Sit. PDF","Status"].map(h=><th key={h} style={C.th}>{h}</th>)}</tr></thead>
+                        <tbody>{form.prestacoes.map((pr,i)=>(
+                          <tr key={i}>
+                            <td style={C.td}>{pr.numero}</td>
+                            <td style={C.td}><input style={{...C.inpSm,...(!pr.vencimento?C.warnInp:{})}} type="date" value={pr.vencimento||""} onChange={e=>{const cp=[...form.prestacoes];cp[i]={...cp[i],vencimento:e.target.value,status:autoStatus(e.target.value,cp[i].situacaoPDF)};sf("prestacoes")(cp);}}/></td>
+                            <td style={C.td}><input style={{...C.inpSm,...(!pr.valor?C.warnInp:{})}} type="number" value={pr.valor||""} onChange={e=>{const cp=[...form.prestacoes];cp[i]={...cp[i],valor:Number(e.target.value)};sf("prestacoes")(cp);}}/></td>
+                            <td style={C.td}><select style={C.inpSm} value={pr.situacaoPDF} onChange={e=>{const cp=[...form.prestacoes];cp[i]={...cp[i],situacaoPDF:e.target.value,status:autoStatus(pr.vencimento,e.target.value)};sf("prestacoes")(cp);}}>
+                              <option>A vencer</option><option>Paga</option><option>Devedora</option></select></td>
+                            <td style={C.td}><Tag s={pr.status}/></td>
+                          </tr>
+                        ))}</tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+                <div style={{display:"flex",gap:10,marginTop:8}}>
+                  <button style={C.primaryBtn} onClick={confirmImport}>✓ Confirmar e Salvar</button>
+                  <button style={C.ghostBtn} onClick={()=>{setImportStep("idle");setForm({});}}>Cancelar</button>
+                  <label style={{...C.ghostBtn,cursor:"pointer"}}>Importar outro<input type="file" accept=".pdf,.xlsx,.xls" style={{display:"none"}} onChange={handleFile}/></label>
+                </div>
+              </div>
+            )}
+          </Page>
+        )}
+
+        {/* FLUXO DE CAIXA */}
+        {view==="fluxo"&&(
+          <Page title="Fluxo de Caixa" sub="Projeção completa — todos os meses até o fim dos parcelamentos">
+            <div style={{display:"flex",gap:14,marginBottom:22,flexWrap:"wrap"}}>
+              <div><L>Cliente</L><select style={C.inp} value={cfCli} onChange={e=>setCfCli(e.target.value)}>
+                <option value="">Todos os clientes</option>
+                {data.clientes.map(c=><option key={c.id} value={c.id}>{c.nome}</option>)}</select></div>
+              <div><L>Órgão</L><select style={C.inp} value={cfOrg} onChange={e=>setCfOrg(e.target.value)}>
+                <option>Todos</option><option>PGFN</option><option>RFB</option></select></div>
+            </div>
+            <div style={C.grid4}>
+              <Stat label="Total Pendente" val={fmt(cashFlow.reduce((s,m)=>s+m.total,0))} accent="#111"/>
+              <Stat label="Vencidas não pagas" val={fmt(cashFlow.reduce((s,m)=>s+m.vencidas,0))} accent="#ef4444"/>
+              <Stat label="Meses com vencimento" val={cashFlow.length} accent="#374151"/>
+              <Stat label="Média mensal" val={fmt(cashFlow.length?cashFlow.reduce((s,m)=>s+m.total,0)/cashFlow.length:0)} accent="#111"/>
+            </div>
+            {cashFlow.length===0?<Empty msg="Nenhuma parcela pendente."/>:<>
+              <div style={C.card}><div style={C.cardTitle}>Vencimentos por mês</div><CF data={cashFlow}/></div>
+              <div style={C.card}>
+                <div style={C.cardTitle}>Tabela mensal</div>
+                <div style={{overflowX:"auto",maxHeight:400,overflowY:"auto"}}>
+                  <table style={C.tbl}>
+                    <thead><tr>{["Mês","A Vencer","Vencidas","Total","Acumulado"].map(h=><th key={h} style={C.th}>{h}</th>)}</tr></thead>
+                    <tbody>{(()=>{let acc=0;return cashFlow.map((m,i)=>{acc+=m.total;return(
+                      <tr key={i} style={{background:m.vencidas>0?"#fef2f2":"transparent"}}>
+                        <td style={{...C.td,fontWeight:600,color:"#111"}}>{m.label}</td>
+                        <td style={{...C.td,color:"#374151"}}>{fmt(m.aVencer)}</td>
+                        <td style={{...C.td,color:m.vencidas>0?"#ef4444":"#9ca3af"}}>{fmt(m.vencidas)}</td>
+                        <td style={{...C.td,fontWeight:700,color:"#111"}}>{fmt(m.total)}</td>
+                        <td style={{...C.td,color:"#9ca3af",fontSize:12}}>{fmt(acc)}</td>
+                      </tr>
+                    );});})()}</tbody>
+                  </table>
+                </div>
+              </div>
+            </>}
+          </Page>
+        )}
+
+        {/* CLIENTES */}
+        {view==="clientes"&&(
+          <Page title="Clientes" sub={`${data.clientes.length} cadastrado${data.clientes.length!==1?"s":""}`}>
+            <div style={{display:"flex",justifyContent:"flex-end",marginBottom:18}}>
+              <button style={C.primaryBtn} onClick={()=>{setForm({});setModal("cliente");}}>+ Novo cliente</button>
+            </div>
+            {data.clientes.length===0?<Empty msg="Nenhum cliente." action="Adicionar" onClick={()=>{setForm({});setModal("cliente");}}/>:
+            <div style={{overflowX:"auto"}}>
+              <table style={C.tbl}>
+                <thead><tr>{["Nome","CNPJ","Responsável","Parcelamentos","Vencidas","Saldo Devedor",""].map(h=><th key={h} style={C.th}>{h}</th>)}</tr></thead>
+                <tbody>{data.clientes.map(c=>{const s=cliStats(c.id);return(
+                  <tr key={c.id} style={C.tr}>
+                    <td style={{...C.td,fontWeight:700,color:"#111"}}>{c.nome}</td>
+                    <td style={{...C.td,fontFamily:"monospace",fontSize:12,color:"#6b7280"}}>{c.cnpj}</td>
+                    <td style={C.td}>{c.responsavel||"—"}</td>
+                    <td style={C.td}>{s.numParc}</td>
+                    <td style={C.td}>{s.vencidas>0?<span style={{color:"#ef4444",fontWeight:700}}>⚠ {s.vencidas}</span>:<span style={{color:"#16a34a"}}>✓ 0</span>}</td>
+                    <td style={{...C.td,fontWeight:700,color:"#111"}}>{fmt(s.saldo)}</td>
+                    <td style={C.td}><button style={C.link} onClick={()=>{setSelCli(c.id);setView("relatorio");}}>Relatório →</button></td>
+                  </tr>
+                );})}
+                </tbody>
+              </table>
+            </div>}
+          </Page>
+        )}
+
+        {/* PARCELAMENTOS */}
+        {view==="parcelamentos"&&(
+          <Page title="Parcelamentos" sub={`${data.parcelamentos.length} registrado${data.parcelamentos.length!==1?"s":""}`}>
+            <div style={{display:"flex",justifyContent:"flex-end",marginBottom:18}}>
+              <button style={C.primaryBtn} onClick={()=>{setForm({});setModal("parc");}} disabled={!data.clientes.length}>+ Novo parcelamento</button>
+            </div>
+            {!data.clientes.length&&<div style={C.warnBox}>⚠ Cadastre um cliente antes.</div>}
+            {data.parcelamentos.length===0?<Empty msg="Nenhum parcelamento."/>:
+            <div style={{overflowX:"auto"}}>
+              <table style={C.tbl}>
+                <thead><tr>{["Cliente","Órgão","Modalidade","Parc.","Pagas","Venc.","A Vencer","Saldo Dev.","Pagamento",""].map(h=><th key={h} style={C.th}>{h}</th>)}</tr></thead>
+                <tbody>{data.parcelamentos.map(p=>{
+                  const c=data.clientes.find(cl=>cl.id===p.clienteId);
+                  const pagas=p.parcelas.filter(x=>x.status==="Paga").length;
+                  const venc=p.parcelas.filter(x=>x.status==="Vencida").length;
+                  const saldo=p.parcelas.filter(x=>x.status!=="Paga").reduce((s,pr)=>s+pr.valor,0);
+                  return(
+                    <tr key={p.id} style={C.tr}>
+                      <td style={{...C.td,fontWeight:600,color:"#111",maxWidth:140}}>{c?.nome||"—"}</td>
+                      <td style={C.td}><OrgTag o={p.orgao}/></td>
+                      <td style={{...C.td,fontSize:12,maxWidth:150,color:"#374151"}}>{p.modalidade}</td>
+                      <td style={C.td}>{p.numParcelas}</td>
+                      <td style={{...C.td,color:"#16a34a",fontWeight:600}}>{pagas}</td>
+                      <td style={{...C.td,color:venc>0?"#ef4444":"#9ca3af",fontWeight:venc>0?700:400}}>{venc}</td>
+                      <td style={{...C.td,color:"#374151"}}>{p.numParcelas-pagas-venc}</td>
+                      <td style={{...C.td,fontWeight:700,color:"#111"}}>{fmt(saldo)}</td>
+                      <td style={C.td}><span style={C.tag}>{p.formaPagamento}</span></td>
+                      <td style={C.td}><button style={C.link} onClick={()=>{setSelParc(p);setModal("parcelas");}}>Parcelas →</button></td>
+                    </tr>
+                  );
+                })}</tbody>
+              </table>
+            </div>}
+          </Page>
+        )}
+
+        {/* RELATÓRIO */}
+        {view==="relatorio"&&(
+          <Page title="Relatório por Cliente" sub="">
+            <div style={{marginBottom:22}}>
+              <select style={C.inp} value={selCli||""} onChange={e=>setSelCli(Number(e.target.value)||null)}>
+                <option value="">— Selecione o cliente —</option>
+                {data.clientes.map(c=><option key={c.id} value={c.id}>{c.nome} — {c.cnpj}</option>)}
+              </select>
+            </div>
+            {cliObj&&<RelatorioCliente data={data} cliente={cliObj} cliStats={cliStats} onParcelas={(p)=>{setSelParc(p);setModal("parcelas");}} onAddParc={()=>{setForm({clienteId:cliObj.id});setModal("parc");}}/>}
+          </Page>
+        )}
+
+        {/* ACESSOS */}
+        {view==="usuarios"&&(
+          <Page title="Acessos de Clientes" sub="Gerencie o login de cada cliente (CNPJ + senha)">
+            <div style={C.card}>
+              <div style={{...C.cardTitle,marginBottom:16}}>Clientes cadastrados</div>
+              {data.clientes.length===0?<Empty msg="Nenhum cliente."/>:
+              <table style={C.tbl}>
+                <thead><tr>{["Cliente","CNPJ (login)","Senha","Status",""].map(h=><th key={h} style={C.th}>{h}</th>)}</tr></thead>
+                <tbody>{data.clientes.map(c=>(
+                  <tr key={c.id} style={C.tr}>
+                    <td style={{...C.td,fontWeight:600,color:"#111"}}>{c.nome}</td>
+                    <td style={{...C.td,fontFamily:"monospace",fontSize:12}}>{c.cnpj}</td>
+                    <td style={C.td}>{c.senha?<span style={{fontFamily:"monospace",fontSize:12,color:"#374151"}}>{"•".repeat(Math.min(c.senha.length,8))}</span>:<span style={{color:"#ef4444",fontSize:12}}>Não definida</span>}</td>
+                    <td style={C.td}>{c.senha?<span style={{color:"#16a34a",fontWeight:600,fontSize:12}}>✓ Ativo</span>:<span style={{color:"#9ca3af",fontSize:12}}>Sem acesso</span>}</td>
+                    <td style={C.td}><button style={C.link} onClick={()=>{setForm({_editId:c.id,senha:c.senha||"",responsavel:c.responsavel||""});setModal("senha");}}>Definir acesso →</button></td>
+                  </tr>
+                ))}</tbody>
+              </table>}
+            </div>
+            <div style={{...C.card,marginTop:16,background:"#f9fafb"}}>
+              <div style={C.cardTitle}>Como funciona o acesso do cliente</div>
+              <p style={{fontSize:13,color:"#6b7280",lineHeight:1.7}}>
+                Cada cliente acessa o portal usando o <b>CNPJ da empresa</b> como login e a senha que você definir acima.<br/>
+                Ao entrar, ele verá apenas os parcelamentos vinculados ao seu CNPJ — sem acesso a outros clientes ou ao painel administrativo.
+              </p>
+            </div>
+          </Page>
+        )}
+      </main>
+
+      {/* MODALS */}
+      {modal==="cliente"&&(
+        <Modal title="Novo Cliente" onClose={()=>setModal(null)}>
+          <FI label="Nome / Razão Social *" v={form.nome||""} s={sf("nome")}/>
+          <FI label="CNPJ *" v={form.cnpj||""} s={sf("cnpj")} ph="00.000.000/0001-00"/>
+          <FI label="Responsável" v={form.responsavel||""} s={sf("responsavel")}/>
+          <FI label="E-mail" v={form.email||""} s={sf("email")}/>
+          <div style={{display:"flex",gap:10,marginTop:8}}>
+            <button style={C.primaryBtn} onClick={addCliente}>Salvar</button>
+            <button style={C.ghostBtn} onClick={()=>setModal(null)}>Cancelar</button>
+          </div>
+        </Modal>
+      )}
+      {modal==="senha"&&(
+        <Modal title="Definir Acesso do Cliente" onClose={()=>setModal(null)}>
+          <div style={{...C.card,background:"#f9fafb",marginBottom:16,padding:"12px 16px"}}>
+            <div style={{fontSize:12,color:"#6b7280"}}>O cliente usará o <b>CNPJ</b> como login e a senha abaixo para acessar o portal.</div>
+          </div>
+          <FI label="Responsável (opcional)" v={form.responsavel||""} s={sf("responsavel")}/>
+          <FI label="Senha de acesso" v={form.senha||""} s={sf("senha")} ph="Defina uma senha segura"/>
+          <div style={{display:"flex",gap:10,marginTop:8}}>
+            <button style={C.primaryBtn} onClick={saveClienteSenha}>Salvar acesso</button>
+            <button style={C.ghostBtn} onClick={()=>setModal(null)}>Cancelar</button>
+          </div>
+        </Modal>
+      )}
+      {modal==="parc"&&(
+        <Modal title="Novo Parcelamento" onClose={()=>setModal(null)} wide>
+          <div style={C.fg2}>
+            <div style={{gridColumn:"1/-1"}}><L>Cliente *</L><select style={C.inp} value={form.clienteId||""} onChange={e=>sf("clienteId")(e.target.value)}>
+              <option value="">— Selecione —</option>{data.clientes.map(c=><option key={c.id} value={c.id}>{c.nome}</option>)}</select></div>
+            <div><L>Órgão *</L><select style={C.inp} value={form.orgao||""} onChange={e=>{sf("orgao")(e.target.value);sf("modalidade")("");}}>
+              <option value="">—</option><option>PGFN</option><option>RFB</option></select></div>
+            <div><L>Modalidade *</L><select style={C.inp} value={form.modalidade||""} onChange={e=>sf("modalidade")(e.target.value)}>
+              <option value="">—</option>{(form.orgao==="PGFN"?PGFN_MOD:form.orgao==="RFB"?RFB_MOD:[]).map(m=><option key={m}>{m}</option>)}</select></div>
+            <FI label="Nº Negociação" v={form.numNegociacao||""} s={sf("numNegociacao")}/>
+            <FI label="Programa (ex: 0042)" v={form.programa||""} s={sf("programa")}/>
+            <FI label="Nº Parcelas *" v={form.numParcelas||""} s={sf("numParcelas")} t="number"/>
+            <FI label="Valor Parcela (R$) *" v={form.valorParcela||""} s={sf("valorParcela")} t="number"/>
+            <FI label="Data 1ª Parcela *" v={form.dataInicio||""} s={sf("dataInicio")} t="date"/>
+            <div><L>Forma Pagamento</L><select style={C.inp} value={form.formaPagamento||"Boleto"} onChange={e=>sf("formaPagamento")(e.target.value)}>
+              <option>Boleto</option><option>Débito Automático</option></select></div>
+            <div><L>Situação</L><select style={C.inp} value={form.situacao||"Ativo"} onChange={e=>sf("situacao")(e.target.value)}>
+              <option>Ativo</option><option>Quitado</option><option>Rescindido</option></select></div>
+            <FI label="Valor Consolidado (R$)" v={form.valorConsolidado||""} s={sf("valorConsolidado")} t="number"/>
+            <FI label="Saldo sem Juros (R$)" v={form.saldoSemJuros||""} s={sf("saldoSemJuros")} t="number"/>
+            <FI label="Saldo com Juros (R$)" v={form.saldoComJuros||""} s={sf("saldoComJuros")} t="number"/>
+            <FI label="Sem Desconto (R$)" v={form.semDesconto||""} s={sf("semDesconto")} t="number"/>
+            <FI label="Desconto (%)" v={form.descontoPercent||""} s={sf("descontoPercent")} t="number"/>
+            <FI label="Após Desconto (R$)" v={form.aposDesconto||""} s={sf("aposDesconto")} t="number"/>
+          </div>
+          <div style={{display:"flex",gap:10,marginTop:16}}>
+            <button style={C.primaryBtn} onClick={()=>addParcelamento()}>Salvar</button>
+            <button style={C.ghostBtn} onClick={()=>setModal(null)}>Cancelar</button>
+          </div>
+        </Modal>
+      )}
+      {modal==="parcelas"&&selParc&&(
+        <Modal title={`Parcelas — ${selParc.modalidade}`} onClose={()=>setModal(null)} wide>
+          <div style={{display:"flex",gap:20,marginBottom:14,fontSize:13,flexWrap:"wrap"}}>
+            <span style={{color:"#374151"}}>Total: <b>{selParc.numParcelas}</b></span>
+            <span style={{color:"#16a34a"}}>Pagas: <b>{selParc.parcelas.filter(x=>x.status==="Paga").length}</b></span>
+            <span style={{color:"#ef4444"}}>Vencidas: <b>{selParc.parcelas.filter(x=>x.status==="Vencida").length}</b></span>
+            <span style={{color:"#374151"}}>A Vencer: <b>{selParc.parcelas.filter(x=>x.status==="A vencer").length}</b></span>
+            <span style={{color:"#111",fontWeight:700}}>Saldo: <b>{fmt(selParc.parcelas.filter(x=>x.status!=="Paga").reduce((s,p)=>s+p.valor,0))}</b></span>
+          </div>
+          <div style={{maxHeight:420,overflowY:"auto"}}>
+            <table style={C.tbl}>
+              <thead><tr>{["Nº","Vencimento","Valor","Status","Ação"].map(h=><th key={h} style={C.th}>{h}</th>)}</tr></thead>
+              <tbody>{selParc.parcelas.map(pr=>(
+                <tr key={pr.numero} style={C.tr}>
+                  <td style={C.td}>{pr.numero}</td>
+                  <td style={C.td}>{fmtDt(pr.vencimento)}</td>
+                  <td style={{...C.td,fontWeight:600,color:"#111"}}>{fmt(pr.valor)}</td>
+                  <td style={C.td}><Tag s={pr.status}/></td>
+                  <td style={C.td}><button style={{...C.link,color:pr.status==="Paga"?"#ef4444":"#16a34a"}} onClick={()=>toggleParcela(selParc.id,pr.numero)}>{pr.status==="Paga"?"Desmarcar":"✓ Marcar paga"}</button></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </Modal>
+      )}
+      {toast&&<div style={{...C.toast,background:toast.type==="err"?"#7f1d1d":"#14532d"}}>{toast.type==="err"?"✕ ":"✓ "}{toast.msg}</div>}
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   CLIENT APP
+───────────────────────────────────────────── */
+function ClientApp({ data, auth, onLogout }) {
+  const cliente = data.clientes.find(c=>c.id===auth.clienteId);
+  const parcelamentos = data.parcelamentos.filter(p=>p.clienteId===auth.clienteId);
+  const [view, setView] = useState("visao");
+  const [selParc, setSelParc] = useState(null);
+  const [modal, setModal] = useState(null);
+
+  const allParcelas = parcelamentos.flatMap(p=>p.parcelas);
+  const pagas   = allParcelas.filter(x=>x.status==="Paga").length;
+  const vencidas= allParcelas.filter(x=>x.status==="Vencida").length;
+  const saldo   = allParcelas.filter(x=>x.status!=="Paga").reduce((s,pr)=>s+pr.valor,0);
+
+  const cashFlow = useMemo(()=>{
+    const map={};
+    parcelamentos.forEach(p=>p.parcelas.forEach(pr=>{
+      if(pr.status==="Paga") return;
+      const k=pr.vencimento.slice(0,7);
+      if(!map[k])map[k]={mes:k,label:mLabel(pr.vencimento+"-01"),total:0,vencidas:0,aVencer:0};
+      map[k].total+=pr.valor;
+      pr.status==="Vencida"?map[k].vencidas+=pr.valor:map[k].aVencer+=pr.valor;
+    }));
+    return Object.values(map).sort((a,b)=>a.mes.localeCompare(b.mes));
+  },[parcelamentos]);
+
+  const nav=[{id:"visao",icon:"◈",label:"Visão Geral"},{id:"fluxo",icon:"▦",label:"Fluxo de Caixa"},{id:"parcelamentos",icon:"≡",label:"Parcelamentos"}];
+
+  return (
+    <div style={C.root}>
+      <style>{FONTS}</style>
+      <aside style={C.sidebar}>
+        <div style={C.sideTop}>
+          <RVMLogo size="sm"/>
+          <div style={{marginTop:6,fontSize:10,color:"#9ca3af",letterSpacing:"0.06em",textTransform:"uppercase"}}>Portal do Cliente</div>
+        </div>
+        <nav style={C.nav}>
+          {nav.map(n=>(
+            <button key={n.id} style={{...C.navBtn,...(view===n.id?C.navActive:{})}} onClick={()=>setView(n.id)}>
+              <span style={{fontSize:12,width:16,textAlign:"center",flexShrink:0}}>{n.icon}</span>{n.label}
+            </button>
+          ))}
+        </nav>
+        <div style={C.sideBot}>
+          <div style={{padding:"8px 12px",background:"#f3f4f6",borderRadius:6,marginBottom:8}}>
+            <div style={{fontSize:11,color:"#6b7280",marginBottom:2}}>Empresa</div>
+            <div style={{fontWeight:700,fontSize:12,color:"#111"}}>{cliente?.nome}</div>
+            <div style={{fontFamily:"monospace",fontSize:11,color:"#9ca3af",marginTop:2}}>{cliente?.cnpj}</div>
+          </div>
+          <button style={{...C.sideSmBtn,color:"#ef4444",borderColor:"#fca5a5"}} onClick={onLogout}>Sair</button>
+        </div>
+      </aside>
+      <main style={C.main}>
+        {view==="visao"&&(
+          <Page title={cliente?.nome||"Minha Conta"} sub={`CNPJ: ${cliente?.cnpj} · ${parcelamentos.length} parcelamento${parcelamentos.length!==1?"s":""}`}>
+            <div style={C.grid4}>
+              <Stat label="Total Parcelas" val={allParcelas.length} accent="#111"/>
+              <Stat label="Pagas" val={pagas} accent="#16a34a"/>
+              <Stat label="Vencidas" val={vencidas} accent="#ef4444"/>
+              <Stat label="Saldo Devedor" val={fmt(saldo)} accent="#111"/>
+            </div>
+            {cashFlow.length>0&&<div style={C.card}><div style={C.cardTitle}>Fluxo de Caixa</div><CF data={cashFlow.slice(0,18)}/></div>}
+            {parcelamentos.length===0?<Empty msg="Nenhum parcelamento registrado. Entre em contato com a RVM Law."/>:
+              parcelamentos.map(p=><ParcCard key={p.id} p={p} onParcelas={()=>{setSelParc(p);setModal("parcelas");}}/>)
+            }
+          </Page>
+        )}
+        {view==="fluxo"&&(
+          <Page title="Fluxo de Caixa" sub="Projeção de vencimentos futuros">
+            <div style={C.grid4}>
+              <Stat label="Total Pendente" val={fmt(cashFlow.reduce((s,m)=>s+m.total,0))} accent="#111"/>
+              <Stat label="Vencidas" val={fmt(cashFlow.reduce((s,m)=>s+m.vencidas,0))} accent="#ef4444"/>
+              <Stat label="Meses com vencimento" val={cashFlow.length} accent="#374151"/>
+              <Stat label="Média mensal" val={fmt(cashFlow.length?cashFlow.reduce((s,m)=>s+m.total,0)/cashFlow.length:0)} accent="#111"/>
+            </div>
+            {cashFlow.length===0?<Empty msg="Nenhum vencimento pendente."/>:<>
+              <div style={C.card}><div style={C.cardTitle}>Vencimentos por mês</div><CF data={cashFlow}/></div>
+              <div style={C.card}>
+                <div style={C.cardTitle}>Tabela detalhada</div>
+                <div style={{overflowX:"auto"}}>
+                  <table style={C.tbl}>
+                    <thead><tr>{["Mês","A Vencer","Vencidas","Total","Acumulado"].map(h=><th key={h} style={C.th}>{h}</th>)}</tr></thead>
+                    <tbody>{(()=>{let acc=0;return cashFlow.map((m,i)=>{acc+=m.total;return(
+                      <tr key={i} style={{background:m.vencidas>0?"#fef2f2":"transparent"}}>
+                        <td style={{...C.td,fontWeight:600,color:"#111"}}>{m.label}</td>
+                        <td style={C.td}>{fmt(m.aVencer)}</td>
+                        <td style={{...C.td,color:m.vencidas>0?"#ef4444":"#9ca3af"}}>{fmt(m.vencidas)}</td>
+                        <td style={{...C.td,fontWeight:700,color:"#111"}}>{fmt(m.total)}</td>
+                        <td style={{...C.td,color:"#9ca3af",fontSize:12}}>{fmt(acc)}</td>
+                      </tr>
+                    );});})()}</tbody>
+                  </table>
+                </div>
+              </div>
+            </>}
+          </Page>
+        )}
+        {view==="parcelamentos"&&(
+          <Page title="Parcelamentos" sub={`${parcelamentos.length} negociação${parcelamentos.length!==1?"ões":""} ativa${parcelamentos.length!==1?"s":""}`}>
+            {parcelamentos.length===0?<Empty msg="Nenhum parcelamento. Entre em contato com a RVM Law."/>:
+              parcelamentos.map(p=><ParcCard key={p.id} p={p} onParcelas={()=>{setSelParc(p);setModal("parcelas");}}/>)}
+          </Page>
+        )}
+        {modal==="parcelas"&&selParc&&(
+          <Modal title={`Parcelas — ${selParc.modalidade}`} onClose={()=>setModal(null)} wide>
+            <div style={{display:"flex",gap:20,marginBottom:14,fontSize:13,flexWrap:"wrap"}}>
+              <span>Total: <b>{selParc.numParcelas}</b></span>
+              <span style={{color:"#16a34a"}}>Pagas: <b>{selParc.parcelas.filter(x=>x.status==="Paga").length}</b></span>
+              <span style={{color:"#ef4444"}}>Vencidas: <b>{selParc.parcelas.filter(x=>x.status==="Vencida").length}</b></span>
+              <span style={{color:"#111",fontWeight:700}}>Saldo: <b>{fmt(selParc.parcelas.filter(x=>x.status!=="Paga").reduce((s,p)=>s+p.valor,0))}</b></span>
+            </div>
+            <div style={{maxHeight:420,overflowY:"auto"}}>
+              <table style={C.tbl}>
+                <thead><tr>{["Nº","Vencimento","Valor","Status"].map(h=><th key={h} style={C.th}>{h}</th>)}</tr></thead>
+                <tbody>{selParc.parcelas.map(pr=>(
+                  <tr key={pr.numero} style={C.tr}>
+                    <td style={C.td}>{pr.numero}</td>
+                    <td style={C.td}>{fmtDt(pr.vencimento)}</td>
+                    <td style={{...C.td,fontWeight:600,color:"#111"}}>{fmt(pr.valor)}</td>
+                    <td style={C.td}><Tag s={pr.status}/></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          </Modal>
+        )}
+      </main>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   SHARED COMPONENTS
+───────────────────────────────────────────── */
+function RelatorioCliente({data,cliente,cliStats,onParcelas,onAddParc}){
+  const ps=data.parcelamentos.filter(p=>p.clienteId===cliente.id);
+  const s=cliStats(cliente.id);
+  const pgfn=ps.filter(p=>p.orgao==="PGFN"), rfb=ps.filter(p=>p.orgao==="RFB");
+  const cfData=(()=>{const map={};ps.forEach(p=>p.parcelas.forEach(pr=>{
+    if(pr.status==="Paga")return;const k=pr.vencimento.slice(0,7);
+    if(!map[k])map[k]={mes:k,label:mLabel(pr.vencimento+"-01"),total:0,vencidas:0,aVencer:0};
+    map[k].total+=pr.valor;pr.status==="Vencida"?map[k].vencidas+=pr.valor:map[k].aVencer+=pr.valor;
+  }));return Object.values(map).sort((a,b)=>a.mes.localeCompare(b.mes));})();
+  return(
+    <div>
+      <div style={{...C.card,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div><div style={{fontWeight:800,fontSize:19,color:"#111"}}>{cliente.nome}</div>
+          <div style={{fontSize:12,color:"#6b7280",marginTop:2}}>CNPJ: {cliente.cnpj}{cliente.responsavel?` · ${cliente.responsavel}`:""}</div></div>
+        <button style={C.primaryBtn} onClick={onAddParc}>+ Parcelamento</button>
+      </div>
+      <div style={C.grid4}>
+        <Stat label="Total Parcelas" val={s.total} accent="#111"/>
+        <Stat label="Pagas" val={s.pagas} accent="#16a34a"/>
+        <Stat label="Vencidas" val={s.vencidas} accent="#ef4444"/>
+        <Stat label="Saldo Devedor" val={fmt(s.saldo)} accent="#111"/>
+      </div>
+      {cfData.length>0&&<div style={C.card}><div style={C.cardTitle}>Fluxo de Caixa</div><CF data={cfData}/></div>}
+      {pgfn.length>0&&<><h3 style={C.secHead}>PGFN</h3>{pgfn.map(p=><ParcCard key={p.id} p={p} onParcelas={()=>onParcelas(p)}/>)}</>}
+      {rfb.length>0&&<><h3 style={C.secHead}>Receita Federal — RFB</h3>{rfb.map(p=><ParcCard key={p.id} p={p} onParcelas={()=>onParcelas(p)}/>)}</>}
+      {ps.length===0&&<Empty msg="Nenhum parcelamento para este cliente."/>}
+    </div>
+  );
+}
+
+function ParcCard({p,onParcelas}){
+  const pagas=p.parcelas.filter(x=>x.status==="Paga").length;
+  const venc=p.parcelas.filter(x=>x.status==="Vencida").length;
+  const saldo=p.parcelas.filter(x=>x.status!=="Paga").reduce((s,pr)=>s+pr.valor,0);
+  const pct=Math.round((pagas/p.numParcelas)*100);
+  return(
+    <div style={C.pCard}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+        <div>
+          <span style={{fontWeight:700,fontSize:14,color:"#111"}}>{p.modalidade}</span>
+          <OrgTag o={p.orgao} style={{marginLeft:8}}/>
+          <span style={{...C.tag,marginLeft:6}}>{p.formaPagamento}</span>
+          {p.descontoPercent>0&&<span style={{...C.tag,marginLeft:6,background:"#fef9c3",color:"#854d0e",border:"1px solid #fde047"}}>Desconto {p.descontoPercent}%</span>}
+          {p.numNegociacao&&<span style={{...C.tag,marginLeft:6,fontSize:10,color:"#9ca3af"}}>#{p.numNegociacao}</span>}
+        </div>
+        <button style={C.link} onClick={onParcelas}>Ver parcelas →</button>
+      </div>
+      <div style={{display:"flex",gap:22,flexWrap:"wrap",marginBottom:14}}>
+        {[["Total",p.numParcelas,"#374151"],["Pagas",pagas,"#16a34a"],["Vencidas",venc,venc>0?"#ef4444":"#9ca3af"],["A Vencer",p.numParcelas-pagas-venc,"#374151"],["Parcela",fmt(p.valorParcela),"#111"],["Saldo Dev.",fmt(saldo),"#111"]].map(([l,v,co])=>(
+          <div key={l}><div style={{fontWeight:700,fontSize:14,color:co}}>{v}</div><div style={{fontSize:11,color:"#9ca3af",marginTop:2}}>{l}</div></div>
+        ))}
+        {p.valorConsolidado>0&&<div><div style={{fontWeight:700,fontSize:14,color:"#374151"}}>{fmt(p.valorConsolidado)}</div><div style={{fontSize:11,color:"#9ca3af",marginTop:2}}>Consolidado</div></div>}
+        {p.saldoComJuros>0&&<div><div style={{fontWeight:700,fontSize:14,color:"#374151"}}>{fmt(p.saldoComJuros)}</div><div style={{fontSize:11,color:"#9ca3af",marginTop:2}}>Saldo c/ Juros</div></div>}
+      </div>
+      <div style={{fontSize:11,color:"#9ca3af",marginBottom:4}}>{pct}% pago ({pagas}/{p.numParcelas})</div>
+      <div style={{height:4,background:"#e5e7eb",borderRadius:99}}><div style={{height:"100%",background:"#111",borderRadius:99,width:`${pct}%`,transition:"width .4s"}}/></div>
+    </div>
+  );
+}
+
+function CF({data:d}){
+  return(
+    <ResponsiveContainer width="100%" height={240}>
+      <BarChart data={d} margin={{top:4,right:8,left:0,bottom:0}}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false}/>
+        <XAxis dataKey="label" tick={{fill:"#9ca3af",fontSize:10}} axisLine={false} tickLine={false} interval={Math.max(0,Math.floor(d.length/16)-1)}/>
+        <YAxis tick={{fill:"#9ca3af",fontSize:10}} axisLine={false} tickLine={false} tickFormatter={v=>v>=1000?`${(v/1000).toFixed(0)}k`:v}/>
+        <Tooltip formatter={(v,n)=>[fmt(v),n]} contentStyle={{background:"#fff",border:"1px solid #e5e7eb",borderRadius:6,fontSize:12}} labelStyle={{color:"#374151",fontWeight:600}}/>
+        <Bar dataKey="aVencer" stackId="a" fill="#374151" name="A Vencer" radius={[0,0,0,0]}/>
+        <Bar dataKey="vencidas" stackId="a" fill="#ef4444" name="Vencidas" radius={[3,3,0,0]}/>
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+function Page({title,sub,children}){ return <section style={{maxWidth:1100}}><h1 style={C.pageTitle}>{title}</h1>{sub&&<p style={C.pageSub}>{sub}</p>}<div style={{marginTop:24}}>{children}</div></section>; }
+function Stat({label,val,accent}){ return <div style={C.statCard}><div style={{fontSize:22,fontWeight:800,color:accent||"#111",letterSpacing:"-.02em"}}>{val}</div><div style={{fontSize:11,color:"#9ca3af",marginTop:4,fontWeight:600,textTransform:"uppercase",letterSpacing:".06em"}}>{label}</div></div>; }
+function Tag({s}){ const cfg={Paga:{c:"#16a34a",bg:"#f0fdf4",b:"#bbf7d0"},Vencida:{c:"#ef4444",bg:"#fef2f2",b:"#fecaca"},"A vencer":{c:"#374151",bg:"#f9fafb",b:"#e5e7eb"}}[s]||{c:"#374151",bg:"#f9fafb",b:"#e5e7eb"}; return <span style={{padding:"2px 8px",borderRadius:4,fontSize:11,fontWeight:600,color:cfg.c,background:cfg.bg,border:`1px solid ${cfg.b}`}}>{s}</span>; }
+function OrgTag({o}){ return <span style={{...C.tag,background:o==="PGFN"?"#eff6ff":"#f0fdf4",color:o==="PGFN"?"#1d4ed8":"#15803d",border:`1px solid ${o==="PGFN"?"#bfdbfe":"#bbf7d0"}`}}>{o}</span>; }
+function Modal({title,onClose,children,wide}){
+  return <div style={C.overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+    <div style={{...C.modal,maxWidth:wide?740:440}}>
+      <div style={C.mHead}><span style={{fontWeight:700,fontSize:16,color:"#111"}}>{title}</span><button style={C.xBtn} onClick={onClose}>✕</button></div>
+      <div style={C.mBody}>{children}</div>
+    </div>
+  </div>;
+}
+function FI({label,v,s,t="text",ph,warn}){ return <div style={{marginBottom:14}}><L>{label}</L><input style={{...C.inp,...(warn?C.warnInp:{})}} type={t} value={v} placeholder={ph||""} onChange={e=>s(e.target.value)}/></div>; }
+function L({children}){ return <label style={C.label}>{children}</label>; }
+function Empty({msg,action,onClick}){ return <div style={C.empty}><p style={{color:"#9ca3af",marginBottom:12}}>{msg}</p>{action&&<button style={C.primaryBtn} onClick={onClick}>{action}</button>}</div>; }
+
+/* ─────────────────────────────────────────────
+   STYLES
+───────────────────────────────────────────── */
+const C = {
+  root:        { display:"flex", minHeight:"100vh", background:"#f8f8f7", color:"#374151", fontFamily:"'Barlow','DM Sans',sans-serif" },
+  // LOGIN
+  loginBg:     { display:"flex", minHeight:"100vh" },
+  loginSide:   { width:420, background:"#111", padding:"48px 44px", display:"flex", flexDirection:"column", flexShrink:0 },
+  loginTagline:{ color:"#fff", fontWeight:700, fontSize:20, marginBottom:12, marginTop:0, lineHeight:1.3 },
+  loginDesc:   { color:"#9ca3af", fontSize:13, lineHeight:1.8 },
+  loginFooter: { color:"#4b5563", fontSize:11 },
+  loginForm:   { flex:1, display:"flex", alignItems:"center", justifyContent:"center", background:"#f8f8f7", padding:"40px 20px" },
+  loginCard:   { background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"36px 32px", width:"100%", maxWidth:400, boxShadow:"0 4px 24px rgba(0,0,0,.06)" },
+  loginCardTitle:{ fontWeight:800, fontSize:22, color:"#111", marginBottom:6 },
+  loginCardSub:{ fontSize:12, color:"#9ca3af", lineHeight:1.7 },
+  eyeBtn:      { position:"absolute", right:10, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", cursor:"pointer", color:"#9ca3af", fontSize:14 },
+  errorBox:    { background:"#fef2f2", border:"1px solid #fecaca", borderRadius:6, padding:"10px 14px", color:"#ef4444", fontSize:13 },
+  // LAYOUT
+  sidebar:     { width:220, background:"#fff", borderRight:"1px solid #e5e7eb", display:"flex", flexDirection:"column", flexShrink:0 },
+  sideTop:     { padding:"20px 16px 16px", borderBottom:"1px solid #e5e7eb" },
+  nav:         { flex:1, padding:"12px 8px", display:"flex", flexDirection:"column", gap:2 },
+  navBtn:      { display:"flex", alignItems:"center", gap:8, padding:"9px 12px", borderRadius:7, background:"none", border:"none", color:"#6b7280", cursor:"pointer", fontSize:13, fontWeight:600, textAlign:"left" },
+  navActive:   { background:"#f3f4f6", color:"#111" },
+  aiTag:       { marginLeft:"auto", background:"#111", color:"#fff", fontSize:9, fontWeight:800, padding:"2px 6px", borderRadius:99 },
+  sideBot:     { padding:"12px 8px 16px", borderTop:"1px solid #e5e7eb", display:"flex", flexDirection:"column", gap:6 },
+  sideSmBtn:   { display:"block", textAlign:"center", padding:"8px 0", borderRadius:6, border:"1px solid #e5e7eb", background:"none", color:"#9ca3af", cursor:"pointer", fontSize:11, fontWeight:600 },
+  main:        { flex:1, overflow:"auto", padding:"36px 40px" },
+  pageTitle:   { fontSize:26, fontWeight:800, letterSpacing:"-.025em", color:"#111", margin:"0 0 4px" },
+  pageSub:     { color:"#9ca3af", fontSize:13, margin:0 },
+  secHead:     { fontSize:11, fontWeight:700, color:"#374151", textTransform:"uppercase", letterSpacing:".1em", margin:"28px 0 12px", borderBottom:"1px solid #e5e7eb", paddingBottom:8 },
+  // COMPONENTS
+  grid4:       { display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:20 },
+  statCard:    { background:"#fff", border:"1px solid #e5e7eb", borderRadius:10, padding:"16px 18px" },
+  card:        { background:"#fff", border:"1px solid #e5e7eb", borderRadius:10, padding:"16px 18px", marginBottom:14 },
+  cardTitle:   { fontWeight:700, fontSize:11, color:"#9ca3af", textTransform:"uppercase", letterSpacing:".08em", marginBottom:12 },
+  pCard:       { background:"#fff", border:"1px solid #e5e7eb", borderRadius:10, padding:"14px 18px", marginBottom:10 },
+  alertRow:    { background:"#fff", border:"1px solid #fee2e2", borderRadius:8, padding:"10px 14px", display:"flex", alignItems:"center", gap:12, marginBottom:8 },
+  tagRed:      { background:"#fef2f2", color:"#ef4444", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:700, border:"1px solid #fecaca" },
+  tag:         { padding:"2px 8px", borderRadius:4, fontSize:11, background:"#f3f4f6", color:"#6b7280", fontWeight:600, border:"1px solid #e5e7eb" },
+  tbl:         { width:"100%", borderCollapse:"collapse", fontSize:13 },
+  th:          { textAlign:"left", padding:"8px 12px", color:"#9ca3af", fontWeight:600, fontSize:10, textTransform:"uppercase", letterSpacing:".07em", borderBottom:"2px solid #f3f4f6" },
+  td:          { padding:"11px 12px", borderBottom:"1px solid #f3f4f6", color:"#374151", verticalAlign:"middle" },
+  tr:          { transition:"background .1s" },
+  uploadBox:   { border:"2px dashed #e5e7eb", borderRadius:12, padding:"56px 40px", textAlign:"center", background:"#fff", display:"flex", flexDirection:"column", alignItems:"center" },
+  successBox:  { background:"#f0fdf4", border:"1px solid #bbf7d0", borderRadius:8, padding:"10px 14px", color:"#15803d", fontSize:13, marginBottom:16 },
+  warnBox:     { background:"#fffbeb", border:"1px solid #fde68a", borderRadius:8, padding:"10px 14px", color:"#92400e", fontSize:13, marginBottom:14 },
+  // FORM
+  inp:         { width:"100%", padding:"9px 12px", borderRadius:6, background:"#fff", border:"1px solid #d1d5db", color:"#111", fontSize:13, fontFamily:"inherit" },
+  inpSm:       { width:"100%", padding:"5px 8px", borderRadius:5, background:"#fff", border:"1px solid #d1d5db", color:"#111", fontSize:12, fontFamily:"inherit" },
+  warnInp:     { borderColor:"#f97316", background:"#fff7ed" },
+  label:       { display:"block", fontSize:10, fontWeight:700, color:"#6b7280", marginBottom:5, textTransform:"uppercase", letterSpacing:".07em" },
+  fg2:         { display:"grid", gridTemplateColumns:"1fr 1fr", gap:"0 16px" },
+  // MODAL
+  overlay:     { position:"fixed", inset:0, background:"rgba(0,0,0,.4)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000 },
+  modal:       { background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, width:"90vw", maxHeight:"90vh", overflow:"auto", boxShadow:"0 20px 60px rgba(0,0,0,.15)" },
+  mHead:       { display:"flex", justifyContent:"space-between", alignItems:"center", padding:"16px 20px", borderBottom:"1px solid #e5e7eb" },
+  mBody:       { padding:"20px" },
+  xBtn:        { background:"none", border:"none", color:"#9ca3af", cursor:"pointer", fontSize:18 },
+  // BUTTONS
+  primaryBtn:  { padding:"10px 20px", borderRadius:7, background:"#111", color:"#fff", border:"none", cursor:"pointer", fontWeight:700, fontSize:13, fontFamily:"inherit" },
+  ghostBtn:    { padding:"10px 20px", borderRadius:7, background:"none", color:"#374151", border:"1px solid #d1d5db", cursor:"pointer", fontSize:13, fontFamily:"inherit" },
+  link:        { background:"none", border:"none", color:"#111", cursor:"pointer", fontSize:13, fontWeight:700, textDecoration:"underline", textUnderlineOffset:3, fontFamily:"inherit" },
+  // MISC
+  toast:       { position:"fixed", bottom:24, right:24, padding:"11px 20px", borderRadius:8, fontWeight:600, fontSize:13, color:"#fff", zIndex:9999 },
+  empty:       { padding:"48px", textAlign:"center", background:"#fff", borderRadius:10, border:"1px dashed #e5e7eb" },
+  center:      { display:"flex", alignItems:"center", justifyContent:"center" },
+};
+
+const FONTS = `
+@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700;800&display=swap');
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #f8f8f7; }
+input, select, button { font-family: 'Barlow', sans-serif; }
+input[type=number]::-webkit-inner-spin-button { opacity: 0.4; }
+`;
